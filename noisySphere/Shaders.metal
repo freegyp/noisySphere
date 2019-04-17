@@ -16,27 +16,124 @@
 
 using namespace metal;
 
+constant float3 lightDirection = float3(10.0,10.0,10.0);
+constant float4 ambientColor = float4(0.0,0.0,0.0,1.0);
+constant float4 diffuseColor = float4(0.0,0.6,0.0,1.0);
+
+class Random{
+public:
+    void seed(unsigned int s){_seed = s;}
+    unsigned rand(){_seed *= 3039177861u; return _seed;}
+    float uniform01(){return float(rand())/float(UINT_MAX);}
+    float uniform(float minimum,float maximum){
+        return minimum + (uniform01()*(maximum-minimum));
+    }
+    unsigned poisson(float mean){
+        float g = exp(-mean);
+        unsigned res = 0;
+        float t = uniform01();
+        while(t>g){
+            res++;
+            t *= uniform01();
+        }
+        return res;
+    }
+private:
+    unsigned int _seed;
+};
+
+float gabor(float K,float a,float F0,float omega0,float x,float y,float tOffset){
+    float gauss_env = K*exp(-M_PI_F*(a*a)*(x*x+y*y));
+    float sin_carrier = cos(2.0*M_PI_F*F0*(x*cos(omega0)+y*sin(omega0)) + tOffset);
+    return gauss_env*sin_carrier;
+}
+
+class Noise{
+public:
+    Noise(float K,float a,float F0,float omega0,float numImpulsesPerKernel,unsigned int period):K(K),a(a),F0(F0),omega0(omega0),period(period){
+        kernelRadius = sqrt(-log(0.05)/M_PI_F)/a;
+        impulseDensity = numImpulsesPerKernel/(M_PI_F*kernelRadius*kernelRadius);
+    }
+    float cell(int i,int j,float x,float y,float tOffset){
+        unsigned int s = (j%period)*period + (i%period);
+        if(s==0)s=1;
+        Random prng;
+        prng.seed(s);
+        float impulsesPerCell = impulseDensity*kernelRadius*kernelRadius;
+        unsigned int numImpulses = prng.poisson(impulsesPerCell);
+        float res = 0.0;
+        for(int k=0;k<(int)(numImpulses);k++){
+            float xi = prng.uniform01();
+            float yi = prng.uniform01();
+            float wi = prng.uniform(-1.0,1.0);
+            float omega0i = prng.uniform(0.0,2.0*M_PI_F);
+            float xix = x-xi;
+            float yiy = y-yi;
+            if(xix*xix+yiy*yiy<1.0){
+                res += wi*gabor(K,a,F0,omega0i,xix*kernelRadius,yiy*kernelRadius,tOffset);
+            }
+        }
+        return res;
+    }
+    float gen(float x,float y,float tOffset){
+        //x /= kernelRadius,y /= kernelRadius;
+        float fracX = fract(x),fracY = fract(y);
+        int i=int(floor(x)),j=int(floor(y));
+        float noise = 0.0;
+        for(int di=-1;di<=1;di++){
+            for(int dj=-1;dj<=1;dj++){
+                int ii = i+di,jj = j+dj;
+                //if(ii<0)ii+=period;
+                //if(jj<0)jj+=period;
+                noise += cell(ii,jj,fracX-di,fracY-dj,tOffset);
+            }
+        }
+        return noise;
+    }
+private:
+    float K,a,F0,omega0,kernelRadius,impulseDensity;
+    unsigned int period;
+};
+
 typedef struct
 {
     float3 position [[attribute(VertexAttributePosition)]];
     float2 texCoord [[attribute(VertexAttributeTexcoord)]];
+    float3 normal [[attribute(VertexAttributeNormal)]];
+    float3 tangent [[attribute(VertexAttributeTangent)]];
+    float3 bitangent [[attribute(VertexAttributeBitangent)]];
 } Vertex;
 
 typedef struct
 {
     float4 position [[position]];
     float2 texCoord;
+    float3 eyeNormal;
 } ColorInOut;
 
 vertex ColorInOut vertexShader(Vertex in [[stage_in]],
-                               constant Uniforms & uniforms [[ buffer(BufferIndexUniforms) ]])
+                               constant Uniforms & uniforms [[ buffer(BufferIndexUniforms) ]],
+                               texture2d<half> dispMap      [[ texture(TextureIndexColor) ]],
+                               texture2d<half> normalMap    [[ texture(TextureIndexOutput) ]])
 {
     ColorInOut out;
+    
+    constexpr sampler colorSampler(mip_filter::linear,
+                                   mag_filter::linear,
+                                   min_filter::linear);
 
-    float4 position = float4(in.position, 1.0);
+    //float4 position = float4(in.position,1.0);
+    float4 position = float4(in.position*(1.0+0.1*dispMap.sample(colorSampler,in.texCoord.xy).y), 1.0);
     out.position = uniforms.projectionMatrix * uniforms.modelViewMatrix * position;
     out.texCoord = in.texCoord;
-
+    
+    half4 mapNormal = normalMap.sample(colorSampler,in.texCoord.xy)*2.0-half4(1.0,1.0,1.0,1.0);
+    
+    //float3 normal = in.normal;
+    float3 normal = in.tangent*mapNormal.x + in.bitangent*mapNormal.y + in.normal*mapNormal.z;
+    float4 eyeNormal = normalize(uniforms.normalMatrix * float4(normal,0));
+    out.eyeNormal = eyeNormal.rgb;
+    
     return out;
 }
 
@@ -48,7 +145,51 @@ fragment float4 fragmentShader(ColorInOut in [[stage_in]],
                                    mag_filter::linear,
                                    min_filter::linear);
 
-    half4 colorSample   = colorMap.sample(colorSampler, in.texCoord.xy);
+    half4 colorSample   = 0.1*colorMap.sample(colorSampler, in.texCoord.xy);
+    
+    float n_dot_l = max(0.0,dot(in.eyeNormal,normalize(lightDirection)));
+    
+    half4 lightColor = half4(ambientColor+4.0*diffuseColor*n_dot_l);
+    
+    
+    return float4(colorSample + lightColor);
+}
 
-    return float4(colorSample);
+kernel void gaborNoiseKernel(constant Uniforms & uniforms [[ buffer(BufferIndexUniforms) ]],
+                             texture2d<half, access::write> outTexture [[texture(TextureIndexOutput)]],
+                             uint2                          gid         [[thread_position_in_grid]]){
+    if((gid.x >= outTexture.get_width()) || (gid.y >= outTexture.get_height()))
+    {
+        return;
+    }
+    
+    Noise generator(0.5,0.05,0.02,M_PI_F/4.0,64.0,32);
+    
+    float intensity = 0.5+generator.gen(float(gid.x)/8.0,float(gid.y)/8.0,uniforms.tOffset);
+    
+    outTexture.write(half4(0.0,intensity,0.0,1.0),gid);
+}
+
+kernel void
+normalKernel(texture2d<half, access::read>  inTexture  [[texture(TextureIndexColor)]],
+                texture2d<half, access::write> outTexture [[texture(TextureIndexOutput)]],
+                uint2                          gid         [[thread_position_in_grid]])
+{
+    // Check if the pixel is within the bounds of the output texture
+    if((gid.x >= outTexture.get_width()) || (gid.y >= outTexture.get_height()))
+    {
+        // Return early if the pixel is out of bounds
+        return;
+    }
+    
+    uint left = (gid.x - 1)%outTexture.get_width(),right = (gid.x + 1)%outTexture.get_width();
+    uint down = (gid.y - 1)%outTexture.get_height(),up = (gid.y + 1)%outTexture.get_height();
+    
+    float3 hor = float3(1.0,0.0,(inTexture.read(uint2(right,gid.y)).y-inTexture.read(uint2(left,gid.y)).y)*8);
+    float3 vert = float3(0.0,1.0,(inTexture.read(uint2(gid.x,up)).y-inTexture.read(uint2(gid.x,down)).y)*8);
+    
+    float4 res = float4((normalize(cross(hor,vert))+float3(1.0,1.0,1.0))/2.0,1.0);
+    
+    outTexture.write(half4(res),gid);
+    
 }

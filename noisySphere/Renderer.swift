@@ -40,7 +40,21 @@ class Renderer: NSObject, MTKViewDelegate {
     
     var projectionMatrix: matrix_float4x4 = matrix_float4x4()
     
-    var rotation: Float = 0
+    var rotationMatrix: matrix_float4x4 = matrix_float4x4()
+    
+    let touchSemaphore = DispatchSemaphore(value: 1)
+    
+    var tOffset:Float = 0.0
+    
+    var threadGroupSize:MTLSize
+    
+    var threadGroupCount:MTLSize
+    
+    var computeNoisePipelineState:MTLComputePipelineState
+    
+    var computeNormalPipelineState:MTLComputePipelineState
+    
+    var normalMap: MTLTexture
     
     var mesh: MTKMesh
     
@@ -73,6 +87,23 @@ class Renderer: NSObject, MTKViewDelegate {
             return nil
         }
         
+        do{
+            computeNoisePipelineState = try Renderer.buildNoiseComputePipeline(device: device)
+        }catch{
+            print("Unable to compile compute pipeline state for noise.")
+            return nil
+        }
+        
+        do{
+            computeNormalPipelineState = try Renderer.buildNormalComputePipeline(device: device)
+        }catch{
+            print("Unable to compile compute pipeline state for normal vectors.")
+            return nil
+        }
+        
+        threadGroupSize = MTLSize(width: 16, height: 8, depth: 1)
+        threadGroupCount = MTLSize(width: 16, height: 32, depth: 1)
+        
         let depthStateDesciptor = MTLDepthStencilDescriptor()
         depthStateDesciptor.depthCompareFunction = MTLCompareFunction.less
         depthStateDesciptor.isDepthWriteEnabled = true
@@ -86,12 +117,9 @@ class Renderer: NSObject, MTKViewDelegate {
             return nil
         }
         
-        do {
-            colorMap = try Renderer.loadTexture(device: device, textureName: "ColorMap")
-        } catch {
-            print("Unable to load texture. Error info: \(error)")
-            return nil
-        }
+        colorMap = Renderer.buildEmptyTexture(device: device)!
+        
+        normalMap = Renderer.buildEmptyTexture(device: device)!
         
         super.init()
         
@@ -111,6 +139,18 @@ class Renderer: NSObject, MTKViewDelegate {
         mtlVertexDescriptor.attributes[VertexAttribute.texcoord.rawValue].offset = 0
         mtlVertexDescriptor.attributes[VertexAttribute.texcoord.rawValue].bufferIndex = BufferIndex.meshGenerics.rawValue
         
+        mtlVertexDescriptor.attributes[VertexAttribute.normal.rawValue].format = MTLVertexFormat.float3
+        mtlVertexDescriptor.attributes[VertexAttribute.normal.rawValue].offset = 0
+        mtlVertexDescriptor.attributes[VertexAttribute.normal.rawValue].bufferIndex = BufferIndex.meshNormals.rawValue
+        
+        mtlVertexDescriptor.attributes[VertexAttribute.tangent.rawValue].format = MTLVertexFormat.float3
+        mtlVertexDescriptor.attributes[VertexAttribute.tangent.rawValue].offset = 0
+        mtlVertexDescriptor.attributes[VertexAttribute.tangent.rawValue].bufferIndex = BufferIndex.meshTagent.rawValue
+        
+        mtlVertexDescriptor.attributes[VertexAttribute.bitangent.rawValue].format = MTLVertexFormat.float3
+        mtlVertexDescriptor.attributes[VertexAttribute.bitangent.rawValue].offset = 0
+        mtlVertexDescriptor.attributes[VertexAttribute.bitangent.rawValue].bufferIndex = BufferIndex.meshBitangent.rawValue
+        
         mtlVertexDescriptor.layouts[BufferIndex.meshPositions.rawValue].stride = 12
         mtlVertexDescriptor.layouts[BufferIndex.meshPositions.rawValue].stepRate = 1
         mtlVertexDescriptor.layouts[BufferIndex.meshPositions.rawValue].stepFunction = MTLVertexStepFunction.perVertex
@@ -119,7 +159,35 @@ class Renderer: NSObject, MTKViewDelegate {
         mtlVertexDescriptor.layouts[BufferIndex.meshGenerics.rawValue].stepRate = 1
         mtlVertexDescriptor.layouts[BufferIndex.meshGenerics.rawValue].stepFunction = MTLVertexStepFunction.perVertex
         
+        mtlVertexDescriptor.layouts[BufferIndex.meshNormals.rawValue].stride = 12
+        mtlVertexDescriptor.layouts[BufferIndex.meshNormals.rawValue].stepRate = 1
+        mtlVertexDescriptor.layouts[BufferIndex.meshNormals.rawValue].stepFunction = MTLVertexStepFunction.perVertex
+        
+        mtlVertexDescriptor.layouts[BufferIndex.meshTagent.rawValue].stride = 12
+        mtlVertexDescriptor.layouts[BufferIndex.meshTagent.rawValue].stepRate = 1
+        mtlVertexDescriptor.layouts[BufferIndex.meshTagent.rawValue].stepFunction = MTLVertexStepFunction.perVertex
+        
+        mtlVertexDescriptor.layouts[BufferIndex.meshBitangent.rawValue].stride = 12
+        mtlVertexDescriptor.layouts[BufferIndex.meshBitangent.rawValue].stepRate = 1
+        mtlVertexDescriptor.layouts[BufferIndex.meshBitangent.rawValue].stepFunction = MTLVertexStepFunction.perVertex
+        
         return mtlVertexDescriptor
+    }
+    
+    class func buildNoiseComputePipeline(device:MTLDevice) throws -> MTLComputePipelineState{
+        let library = device.makeDefaultLibrary()
+        
+        let kernelFunction = library?.makeFunction(name: "gaborNoiseKernel")
+        
+        return try device.makeComputePipelineState(function: kernelFunction!)
+    }
+    
+    class func buildNormalComputePipeline(device:MTLDevice) throws -> MTLComputePipelineState{
+        let library = device.makeDefaultLibrary()
+        
+        let kernelFunction = library?.makeFunction(name: "normalKernel")
+        
+        return try device.makeComputePipelineState(function: kernelFunction!)
     }
     
     class func buildRenderPipelineWithDevice(device: MTLDevice,
@@ -152,11 +220,12 @@ class Renderer: NSObject, MTKViewDelegate {
         
         let metalAllocator = MTKMeshBufferAllocator(device: device)
         
-        let mdlMesh = MDLMesh.newBox(withDimensions: float3(4, 4, 4),
+        /*let mdlMesh = MDLMesh.newBox(withDimensions: float3(4, 4, 4),
                                      segments: uint3(2, 2, 2),
                                      geometryType: MDLGeometryType.triangles,
                                      inwardNormals:false,
-                                     allocator: metalAllocator)
+                                     allocator: metalAllocator)*/
+        let mdlMesh = MDLMesh.newEllipsoid(withRadii: float3(2,2,2), radialSegments: 32, verticalSegments: 32, geometryType: MDLGeometryType.triangles, inwardNormals: false, hemisphere: false, allocator: metalAllocator)
         
         let mdlVertexDescriptor = MTKModelIOVertexDescriptorFromMetal(mtlVertexDescriptor)
         
@@ -165,6 +234,9 @@ class Renderer: NSObject, MTKViewDelegate {
         }
         attributes[VertexAttribute.position.rawValue].name = MDLVertexAttributePosition
         attributes[VertexAttribute.texcoord.rawValue].name = MDLVertexAttributeTextureCoordinate
+        attributes[VertexAttribute.normal.rawValue].name = MDLVertexAttributeNormal
+        attributes[VertexAttribute.tangent.rawValue].name = MDLVertexAttributeTangent
+        attributes[VertexAttribute.bitangent.rawValue].name = MDLVertexAttributeBitangent
         
         mdlMesh.vertexDescriptor = mdlVertexDescriptor
         
@@ -189,6 +261,17 @@ class Renderer: NSObject, MTKViewDelegate {
         
     }
     
+    class func buildEmptyTexture(device:MTLDevice) -> MTLTexture?{
+        let textureDescriptor = MTLTextureDescriptor()
+        textureDescriptor.textureType = MTLTextureType.type2D
+        textureDescriptor.pixelFormat = MTLPixelFormat.bgra8Unorm
+        textureDescriptor.width = 256
+        textureDescriptor.height = 256
+        textureDescriptor.usage = MTLTextureUsage(rawValue: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue)
+        
+        return device.makeTexture(descriptor: textureDescriptor)
+    }
+    
     private func updateDynamicBufferState() {
         /// Update the state of our uniform buffers before rendering
         
@@ -204,11 +287,15 @@ class Renderer: NSObject, MTKViewDelegate {
         
         uniforms[0].projectionMatrix = projectionMatrix
         
-        let rotationAxis = float3(1, 1, 0)
-        let modelMatrix = matrix4x4_rotation(radians: rotation, axis: rotationAxis)
-        let viewMatrix = matrix4x4_translation(0.0, 0.0, -8.0)
-        uniforms[0].modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
-        rotation += 0.01
+        //let rotationAxis = float3(0, 1, 0)
+        //let modelMatrix = matrix4x4_rotation(radians: rotation, axis: rotationAxis)
+        let viewMatrix = matrix4x4_translation(0.0, 0.0, -9.0)
+        touchSemaphore.wait()
+        uniforms[0].modelViewMatrix = simd_mul(viewMatrix, rotationMatrix)
+        touchSemaphore.signal()
+        uniforms[0].normalMatrix = simd_inverse(simd_transpose(uniforms[0].modelViewMatrix))
+        uniforms[0].tOffset = tOffset
+        tOffset += 0.08
     }
     
     func draw(in view: MTKView) {
@@ -227,9 +314,39 @@ class Renderer: NSObject, MTKViewDelegate {
             
             self.updateGameState()
             
+            if let computeEncoder = commandBuffer.makeComputeCommandEncoder(){
+                computeEncoder.pushDebugGroup("Calculate Noise Map")
+                
+                computeEncoder.setComputePipelineState(computeNoisePipelineState)
+                
+                computeEncoder.setBuffer(dynamicUniformBuffer, offset: uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                
+                computeEncoder.setTexture(colorMap, index: TextureIndex.output.rawValue)
+                
+                computeEncoder.dispatchThreadgroups(threadGroupSize, threadsPerThreadgroup: threadGroupCount)
+                
+                computeEncoder.popDebugGroup()
+                
+                computeEncoder.pushDebugGroup("Calculate Normal Map")
+                
+                computeEncoder.setComputePipelineState(computeNormalPipelineState)
+                
+                computeEncoder.setTexture(colorMap, index: TextureIndex.color.rawValue)
+                
+                computeEncoder.setTexture(normalMap, index: TextureIndex.output.rawValue)
+                
+                computeEncoder.dispatchThreadgroups(threadGroupSize, threadsPerThreadgroup: threadGroupCount)
+                
+                computeEncoder.popDebugGroup()
+                
+                computeEncoder.endEncoding()
+            }
+            
             /// Delay getting the currentRenderPassDescriptor until we absolutely need it to avoid
             ///   holding onto the drawable and blocking the display pipeline any longer than necessary
             let renderPassDescriptor = view.currentRenderPassDescriptor
+            
+            renderPassDescriptor?.colorAttachments[0].clearColor = MTLClearColor(red: 0.25, green: 0.25, blue: 0.25, alpha: 1.0)
             
             if let renderPassDescriptor = renderPassDescriptor, let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
                 
@@ -248,6 +365,10 @@ class Renderer: NSObject, MTKViewDelegate {
                 
                 renderEncoder.setVertexBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
                 renderEncoder.setFragmentBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                
+                renderEncoder.setVertexTexture(colorMap, index: TextureIndex.color.rawValue)
+                
+                renderEncoder.setVertexTexture(normalMap, index: TextureIndex.output.rawValue)
                 
                 for (index, element) in mesh.vertexDescriptor.layouts.enumerated() {
                     guard let layout = element as? MDLVertexBufferLayout else {
@@ -289,6 +410,16 @@ class Renderer: NSObject, MTKViewDelegate {
         
         let aspect = Float(size.width) / Float(size.height)
         projectionMatrix = matrix_perspective_right_hand(fovyRadians: radians_from_degrees(65), aspectRatio:aspect, nearZ: 0.1, farZ: 100.0)
+        rotationMatrix = matrix4x4_rotation(radians: 0.0, axis: float3(x: 0, y: 1, z: 0))
+    }
+    
+    func rotate(radians: Float,axis: float3){
+        DispatchQueue.global().async { [unowned self] in
+            self.touchSemaphore.wait()
+            let curRot = matrix4x4_rotation(radians: radians, axis: axis)
+            self.rotationMatrix = simd_mul(self.rotationMatrix, curRot)
+            self.touchSemaphore.signal()
+        }
     }
 }
 
