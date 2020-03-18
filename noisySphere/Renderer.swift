@@ -10,6 +10,7 @@
 
 import Metal
 import MetalKit
+import MetalPerformanceShaders
 import simd
 
 // The 256 byte aligned size of our uniform structure
@@ -29,6 +30,8 @@ class Renderer: NSObject, MTKViewDelegate {
     var pipelineState: MTLRenderPipelineState
     var depthState: MTLDepthStencilState
     var colorMap: MTLTexture
+    
+    var screenRepTexture: MTLTexture?
     
     let inFlightSemaphore = DispatchSemaphore(value: maxBuffersInFlight)
     
@@ -50,15 +53,34 @@ class Renderer: NSObject, MTKViewDelegate {
     
     var threadGroupCount:MTLSize
     
+    var threadGroupSizeThresh:MTLSize
+    
+    var threadGroupCountThresh:MTLSize
+    
     var computeNoisePipelineState:MTLComputePipelineState
     
     var computeNormalPipelineState:MTLComputePipelineState
+    
+    var computeThresholdPipelineState:MTLComputePipelineState
+    
+    var computeCombinePipelineState:MTLComputePipelineState
     
     var normalMap: MTLTexture
     
     var mesh: MTKMesh
     
+    var metalLayer: CAMetalLayer
+    
+    var viewWidth:Int,viewHeight:Int
+    
     init?(metalKitView: MTKView) {
+        self.viewWidth = Int(metalKitView.drawableSize.width)
+        self.viewHeight = Int(metalKitView.drawableSize.height)
+        
+        self.metalLayer = metalKitView.layer as! CAMetalLayer
+        
+        self.metalLayer.framebufferOnly = false
+        
         self.device = metalKitView.device!
         guard let queue = self.device.makeCommandQueue() else { return nil }
         self.commandQueue = queue
@@ -73,7 +95,7 @@ class Renderer: NSObject, MTKViewDelegate {
         uniforms = UnsafeMutableRawPointer(dynamicUniformBuffer.contents()).bindMemory(to:Uniforms.self, capacity:1)
         
         metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
-        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
+        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm
         metalKitView.sampleCount = 1
         
         let mtlVertexDescriptor = Renderer.buildMetalVertexDescriptor()
@@ -101,8 +123,26 @@ class Renderer: NSObject, MTKViewDelegate {
             return nil
         }
         
+        do{
+            computeThresholdPipelineState = try Renderer.buildThresholdComputePipeline(device: device)
+        }catch{
+            print("Unable to compile compute pipeline state for color threshold.")
+            return nil
+        }
+        
+        do{
+            computeCombinePipelineState = try Renderer.buildCombineComputePipeline(device: device)
+        }catch{
+            print("Unable to compile compute pipeline state for color combine.")
+            return nil
+        }
+        
         threadGroupSize = MTLSize(width: 16, height: 8, depth: 1)
         threadGroupCount = MTLSize(width: 16, height: 32, depth: 1)
+        
+        threadGroupSizeThresh = MTLSize(width: 16, height: 8, depth: 1)
+        threadGroupCountThresh = MTLSize(width: viewWidth/threadGroupSizeThresh.width+1, height: viewHeight/threadGroupSizeThresh.height+1, depth: 1)
+        
         
         let depthStateDesciptor = MTLDepthStencilDescriptor()
         depthStateDesciptor.depthCompareFunction = MTLCompareFunction.less
@@ -190,6 +230,22 @@ class Renderer: NSObject, MTKViewDelegate {
         return try device.makeComputePipelineState(function: kernelFunction!)
     }
     
+    class func buildThresholdComputePipeline(device:MTLDevice) throws -> MTLComputePipelineState{
+        let library = device.makeDefaultLibrary()
+        
+        let kernelFunction = library?.makeFunction(name: "thresholdKernel")
+        
+        return try device.makeComputePipelineState(function: kernelFunction!)
+    }
+    
+    class func buildCombineComputePipeline(device:MTLDevice) throws -> MTLComputePipelineState{
+        let library = device.makeDefaultLibrary()
+        
+        let kernelFunction = library?.makeFunction(name: "combineKernel")
+        
+        return try device.makeComputePipelineState(function: kernelFunction!)
+    }
+    
     class func buildRenderPipelineWithDevice(device: MTLDevice,
                                              metalKitView: MTKView,
                                              mtlVertexDescriptor: MTLVertexDescriptor) throws -> MTLRenderPipelineState {
@@ -261,6 +317,17 @@ class Renderer: NSObject, MTKViewDelegate {
         
     }
     
+    func buildScreenRepTexture(device:MTLDevice) -> MTLTexture?{
+        let textureDescriptor = MTLTextureDescriptor()
+        textureDescriptor.textureType = MTLTextureType.type2D
+        textureDescriptor.pixelFormat = MTLPixelFormat.bgra8Unorm
+        textureDescriptor.width = self.viewWidth*4
+        textureDescriptor.height = self.viewHeight*4
+        textureDescriptor.usage = MTLTextureUsage(rawValue: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue)
+        
+        return device.makeTexture(descriptor: textureDescriptor)
+    }
+    
     class func buildEmptyTexture(device:MTLDevice) -> MTLTexture?{
         let textureDescriptor = MTLTextureDescriptor()
         textureDescriptor.textureType = MTLTextureType.type2D
@@ -295,7 +362,7 @@ class Renderer: NSObject, MTKViewDelegate {
         touchSemaphore.signal()
         uniforms[0].normalMatrix = simd_inverse(simd_transpose(uniforms[0].modelViewMatrix))
         uniforms[0].tOffset = tOffset
-        tOffset += 0.08
+        tOffset += 0.06
     }
     
     func draw(in view: MTKView) {
@@ -395,10 +462,63 @@ class Renderer: NSObject, MTKViewDelegate {
                 renderEncoder.popDebugGroup()
                 
                 renderEncoder.endEncoding()
+
+            }
+            
+            let screenDrawable = view.currentDrawable!
+            
+            let screenTexture = screenDrawable.texture
+            
+            if let computeEncoder = commandBuffer.makeComputeCommandEncoder(){
                 
-                if let drawable = view.currentDrawable {
-                    commandBuffer.present(drawable)
+                computeEncoder.pushDebugGroup("Calculate Color Threshold")
+                
+                computeEncoder.setComputePipelineState(computeThresholdPipelineState)
+                
+                computeEncoder.setTexture(screenTexture, index: TextureIndex.color.rawValue)
+                
+                if screenRepTexture==nil{
+                    screenRepTexture = buildScreenRepTexture(device: device)
                 }
+                
+                computeEncoder.setTexture(screenRepTexture!, index: TextureIndex.output.rawValue)
+                
+                computeEncoder.dispatchThreadgroups(threadGroupCountThresh, threadsPerThreadgroup: threadGroupSizeThresh)
+                
+                computeEncoder.popDebugGroup()
+                
+                computeEncoder.endEncoding()
+                
+                let blurKernel = MPSImageGaussianBlur(device: device, sigma: 50.0)
+                
+                blurKernel.encode(commandBuffer: commandBuffer, inPlaceTexture: &screenRepTexture!, fallbackCopyAllocator: nil)
+            }
+            
+            if let computeEncoder = commandBuffer.makeComputeCommandEncoder(){
+                
+                computeEncoder.pushDebugGroup("Calculate Color Combined")
+                
+                computeEncoder.setComputePipelineState(computeCombinePipelineState)
+                
+                computeEncoder.setTexture(screenTexture, index: 0)
+                
+                if screenRepTexture==nil{
+                    screenRepTexture = buildScreenRepTexture(device: device)
+                }
+                
+                computeEncoder.setTexture(screenRepTexture!, index: 1)
+                
+                computeEncoder.setTexture(screenTexture, index: 2)
+                
+                computeEncoder.dispatchThreadgroups(threadGroupCountThresh, threadsPerThreadgroup: threadGroupSizeThresh)
+                
+                computeEncoder.popDebugGroup()
+                
+                computeEncoder.endEncoding()
+            }
+            
+            if let drawable = view.currentDrawable {
+                commandBuffer.present(drawable)
             }
             
             commandBuffer.commit()

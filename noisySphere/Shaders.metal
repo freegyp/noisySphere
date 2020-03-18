@@ -145,14 +145,15 @@ fragment float4 fragmentShader(ColorInOut in [[stage_in]],
                                    mag_filter::linear,
                                    min_filter::linear);
 
-    half4 colorSample   = 0.1*colorMap.sample(colorSampler, in.texCoord.xy);
+    half4 colorSample   = colorMap.sample(colorSampler, in.texCoord.xy);
     
     float n_dot_l = max(0.0,dot(in.eyeNormal,normalize(lightDirection)));
     
     half4 lightColor = half4(ambientColor+4.0*diffuseColor*n_dot_l);
     
+    colorSample.y = colorSample.y * 0.7 + 0.3;
     
-    return float4(colorSample + lightColor);
+    return float4(colorSample);
 }
 
 kernel void gaborNoiseKernel(constant Uniforms & uniforms [[ buffer(BufferIndexUniforms) ]],
@@ -192,4 +193,37 @@ normalKernel(texture2d<half, access::read>  inTexture  [[texture(TextureIndexCol
     
     outTexture.write(half4(res),gid);
     
+}
+
+kernel void thresholdKernel(texture2d<float, access::read>  inTexture  [[texture(TextureIndexColor)]],
+                            texture2d<float, access::write> outTexture [[texture(TextureIndexOutput)]],
+                            uint2                          gid         [[thread_position_in_grid]]){
+    if((gid.x >= outTexture.get_width()) || (gid.y >= outTexture.get_height()))
+    {
+        // Return early if the pixel is out of bounds
+        return;
+    }
+    
+    float4 blank = float4(0.0,0.0,0.0,0.0);
+    float4 inColor = inTexture.read(uint2(gid.x,gid.y));
+    float4 outColor = inColor.y>0.99 ? inColor:blank;
+    
+    outTexture.write(outColor, uint2(gid.x,gid.y));
+}
+
+kernel void combineKernel(texture2d<float, access::read>  inTextureScreen  [[texture(0)]],
+                          texture2d<float, access::read>  inTextureProc  [[texture(1)]],
+                          texture2d<float, access::write> outTexture [[texture(2)]],
+                          uint2                          gid         [[thread_position_in_grid]]){
+    if((gid.x >= outTexture.get_width()) || (gid.y >= outTexture.get_height()))
+    {
+        // Return early if the pixel is out of bounds
+        return;
+    }
+    
+    float4 inColorScreen = inTextureScreen.read(uint2(gid.x,gid.y));
+    float4 inColorProc = inTextureProc.read(uint2(gid.x,gid.y));
+    float4 outColor = inColorProc*4.0 + inColorScreen;
+    
+    outTexture.write(outColor, uint2(gid.x,gid.y));
 }

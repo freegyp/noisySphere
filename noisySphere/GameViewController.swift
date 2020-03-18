@@ -6,6 +6,23 @@
 //  Copyright © 2019 Yupeng Gu. All rights reserved.
 //
 
+extension UIView {
+    var deepDescription:String{
+        get{
+            var res = description
+            for sub in subviews{
+                let subRes = sub.deepDescription
+                let subComps = subRes.split(separator: "\n")
+                for comp in subComps{
+                    res.append("\n-")
+                    res.append(contentsOf: comp)
+                }
+            }
+            return res
+        }
+    }
+}
+
 import UIKit
 import MetalKit
 
@@ -43,6 +60,8 @@ class GameViewController: UIViewController {
         renderer.mtkView(mtkView, drawableSizeWillChange: mtkView.drawableSize)
 
         mtkView.delegate = renderer
+        
+        print(self.view.deepDescription)
     }
     
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
