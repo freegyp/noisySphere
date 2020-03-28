@@ -33,6 +33,11 @@ class Renderer: NSObject, MTKViewDelegate {
     
     var screenRepTexture: MTLTexture?
     
+    var waterDropTexture: MTLTexture
+    var intermTexture: MTLTexture
+    
+    var convIntermTexture: MTLTexture
+    
     let inFlightSemaphore = DispatchSemaphore(value: maxBuffersInFlight)
     
     var uniformBufferOffset = 0
@@ -57,6 +62,10 @@ class Renderer: NSObject, MTKViewDelegate {
     
     var threadGroupCountThresh:MTLSize
     
+    var threadGroupSizeFire:MTLSize
+    
+    var threadGroupCountFire:MTLSize
+    
     var computeNoisePipelineState:MTLComputePipelineState
     
     var computeNormalPipelineState:MTLComputePipelineState
@@ -64,6 +73,14 @@ class Renderer: NSObject, MTKViewDelegate {
     var computeThresholdPipelineState:MTLComputePipelineState
     
     var computeCombinePipelineState:MTLComputePipelineState
+    
+    var computeClearPipelineState:MTLComputePipelineState
+    
+    var computeDistortNoisePipelineState:MTLComputePipelineState
+    
+    var computeDistortPipelineState:MTLComputePipelineState
+    
+    var computeCombineFirePipelineState:MTLComputePipelineState
     
     var normalMap: MTLTexture
     
@@ -137,10 +154,50 @@ class Renderer: NSObject, MTKViewDelegate {
             return nil
         }
         
-        threadGroupSize = MTLSize(width: 16, height: 8, depth: 1)
-        threadGroupCount = MTLSize(width: 16, height: 32, depth: 1)
+        intermTexture = Renderer.buildIntermTexture(device: device)!
         
-        threadGroupSizeThresh = MTLSize(width: 16, height: 8, depth: 1)
+        do{
+            computeClearPipelineState = try Renderer.buildClearComputePipeline(device: device)
+        }catch {
+            print("Unable to build clear compute pipeline state.")
+            return nil
+        }
+        
+        do {
+            computeDistortNoisePipelineState = try Renderer.buildDistortNoiseComputePipeline(device: device)
+        } catch {
+            print("Unable to build distort noise compute pipeline state.")
+            return nil
+        }
+        
+        do{
+            computeDistortPipelineState = try Renderer.buildDistortComputePipeline(device: device)
+        }catch {
+            print("Unable to build distort compute pipeline state.")
+            return nil
+        }
+        
+        do{
+            computeCombineFirePipelineState = try Renderer.buildCombineFireComputePipeline(device: device)
+        }catch {
+            print("Unable to build combine fire compute pipeline state.")
+            return nil
+        }
+        
+        do {
+            waterDropTexture = try Renderer.loadTexture(device: device, textureName: "Waterdrop")
+        } catch {
+            print("Unable to load texture waterdrop. Error info: \(error)")
+            return nil
+        }
+        
+        threadGroupSizeFire = MTLSize(width: 16, height: 16, depth: 1)
+        threadGroupCountFire = MTLSize(width: 33, height: 33, depth: 1)
+        
+        threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        threadGroupCount = MTLSize(width: 16, height: 16, depth: 1)
+        
+        threadGroupSizeThresh = MTLSize(width: 16, height: 16, depth: 1)
         threadGroupCountThresh = MTLSize(width: viewWidth/threadGroupSizeThresh.width+1, height: viewHeight/threadGroupSizeThresh.height+1, depth: 1)
         
         
@@ -160,6 +217,8 @@ class Renderer: NSObject, MTKViewDelegate {
         colorMap = Renderer.buildEmptyTexture(device: device)!
         
         normalMap = Renderer.buildEmptyTexture(device: device)!
+        
+        convIntermTexture = Renderer.buildConvIntermTexture(device: device, width: viewWidth, height: viewHeight)!
         
         super.init()
         
@@ -214,6 +273,30 @@ class Renderer: NSObject, MTKViewDelegate {
         return mtlVertexDescriptor
     }
     
+    class func buildClearComputePipeline(device:MTLDevice) throws -> MTLComputePipelineState{
+        let library = device.makeDefaultLibrary()
+        
+        let kernelFunction = library?.makeFunction(name: "clearKernel")
+        
+        return try device.makeComputePipelineState(function: kernelFunction!)
+    }
+    
+    class func buildDistortNoiseComputePipeline(device:MTLDevice) throws -> MTLComputePipelineState{
+        let library = device.makeDefaultLibrary()
+        
+        let kernelFunction = library?.makeFunction(name: "distortNoiseKernel")
+        
+        return try device.makeComputePipelineState(function: kernelFunction!)
+    }
+    
+    class func buildDistortComputePipeline(device:MTLDevice) throws -> MTLComputePipelineState{
+        let library = device.makeDefaultLibrary()
+        
+        let kernelFunction = library?.makeFunction(name: "distortKernel")
+        
+        return try device.makeComputePipelineState(function: kernelFunction!)
+    }
+    
     class func buildNoiseComputePipeline(device:MTLDevice) throws -> MTLComputePipelineState{
         let library = device.makeDefaultLibrary()
         
@@ -242,6 +325,14 @@ class Renderer: NSObject, MTKViewDelegate {
         let library = device.makeDefaultLibrary()
         
         let kernelFunction = library?.makeFunction(name: "combineKernel")
+        
+        return try device.makeComputePipelineState(function: kernelFunction!)
+    }
+    
+    class func buildCombineFireComputePipeline(device:MTLDevice) throws -> MTLComputePipelineState{
+        let library = device.makeDefaultLibrary()
+        
+        let kernelFunction = library?.makeFunction(name: "combineFireKernel")
         
         return try device.makeComputePipelineState(function: kernelFunction!)
     }
@@ -306,7 +397,7 @@ class Renderer: NSObject, MTKViewDelegate {
         let textureLoader = MTKTextureLoader(device: device)
         
         let textureLoaderOptions = [
-            MTKTextureLoader.Option.textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+            MTKTextureLoader.Option.textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue),
             MTKTextureLoader.Option.textureStorageMode: NSNumber(value: MTLStorageMode.`private`.rawValue)
         ]
         
@@ -317,12 +408,35 @@ class Renderer: NSObject, MTKViewDelegate {
         
     }
     
+    class func buildConvIntermTexture(device:MTLDevice,width:Int,height:Int) -> MTLTexture?{
+        let textureDescriptor = MTLTextureDescriptor()
+        textureDescriptor.textureType = MTLTextureType.type3D
+        textureDescriptor.pixelFormat = MTLPixelFormat.r8Unorm
+        textureDescriptor.width = width
+        textureDescriptor.height = height/2
+        textureDescriptor.depth = 32
+        textureDescriptor.usage = MTLTextureUsage(rawValue: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue)
+        
+        return device.makeTexture(descriptor: textureDescriptor)
+    }
+    
+    class func buildIntermTexture(device:MTLDevice) -> MTLTexture?{
+        let textureDescriptor = MTLTextureDescriptor()
+        textureDescriptor.textureType = MTLTextureType.type2D
+        textureDescriptor.pixelFormat = MTLPixelFormat.bgra8Unorm
+        textureDescriptor.width = 513
+        textureDescriptor.height = 513
+        textureDescriptor.usage = MTLTextureUsage(rawValue: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue)
+        
+        return device.makeTexture(descriptor: textureDescriptor)
+    }
+    
     func buildScreenRepTexture(device:MTLDevice) -> MTLTexture?{
         let textureDescriptor = MTLTextureDescriptor()
         textureDescriptor.textureType = MTLTextureType.type2D
         textureDescriptor.pixelFormat = MTLPixelFormat.bgra8Unorm
-        textureDescriptor.width = self.viewWidth*4
-        textureDescriptor.height = self.viewHeight*4
+        textureDescriptor.width = self.viewWidth
+        textureDescriptor.height = self.viewHeight
         textureDescriptor.usage = MTLTextureUsage(rawValue: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue)
         
         return device.makeTexture(descriptor: textureDescriptor)
@@ -362,7 +476,7 @@ class Renderer: NSObject, MTKViewDelegate {
         touchSemaphore.signal()
         uniforms[0].normalMatrix = simd_inverse(simd_transpose(uniforms[0].modelViewMatrix))
         uniforms[0].tOffset = tOffset
-        tOffset += 0.06
+        tOffset += 0.04
     }
     
     func draw(in view: MTKView) {
@@ -413,7 +527,7 @@ class Renderer: NSObject, MTKViewDelegate {
             ///   holding onto the drawable and blocking the display pipeline any longer than necessary
             let renderPassDescriptor = view.currentRenderPassDescriptor
             
-            renderPassDescriptor?.colorAttachments[0].clearColor = MTLClearColor(red: 0.25, green: 0.25, blue: 0.25, alpha: 1.0)
+            renderPassDescriptor?.colorAttachments[0].clearColor = MTLClearColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
             
             if let renderPassDescriptor = renderPassDescriptor, let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
                 
@@ -495,6 +609,66 @@ class Renderer: NSObject, MTKViewDelegate {
             }
             
             if let computeEncoder = commandBuffer.makeComputeCommandEncoder(){
+                computeEncoder.pushDebugGroup("Clear kernel texture")
+                
+                computeEncoder.setComputePipelineState(computeClearPipelineState)
+                
+                computeEncoder.setTexture(intermTexture, index: 0)
+                
+                computeEncoder.dispatchThreadgroups(threadGroupCountFire, threadsPerThreadgroup: threadGroupSizeFire)
+                
+                computeEncoder.popDebugGroup()
+                
+                computeEncoder.pushDebugGroup("Distort noise")
+                
+                computeEncoder.setComputePipelineState(computeDistortNoisePipelineState)
+                
+                computeEncoder.setTexture(waterDropTexture, index: 0)
+                
+                computeEncoder.setTexture(waterDropTexture, index: 1)
+                
+                computeEncoder.setBuffer(dynamicUniformBuffer, offset: uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                
+                computeEncoder.dispatchThreadgroups(threadGroupCountFire, threadsPerThreadgroup: threadGroupSizeFire)
+                
+                computeEncoder.popDebugGroup()
+                
+                computeEncoder.pushDebugGroup("Distort fire shape")
+                
+                computeEncoder.setComputePipelineState(computeDistortPipelineState)
+                
+                computeEncoder.setTexture(waterDropTexture, index: 0)
+                
+                computeEncoder.setTexture(intermTexture, index: 1)
+                
+                //computeEncoder.setBuffer(dynamicUniformBuffer, offset: uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                
+                computeEncoder.dispatchThreadgroups(threadGroupCountFire, threadsPerThreadgroup: threadGroupSizeFire)
+                
+                computeEncoder.popDebugGroup()
+                
+                computeEncoder.endEncoding()
+            }
+            
+            let blurFireKernel = MPSImageGaussianBlur(device: device, sigma: 5.0)
+            
+            blurFireKernel.encode(commandBuffer: commandBuffer, inPlaceTexture: &intermTexture, fallbackCopyAllocator: nil)
+            
+            if let computeEncoder = commandBuffer.makeComputeCommandEncoder(){
+                
+                computeEncoder.pushDebugGroup("Calculate Fire Color Combined")
+                
+                computeEncoder.setComputePipelineState(computeCombineFirePipelineState)
+                
+                computeEncoder.setTexture(screenTexture, index: 0)
+                
+                computeEncoder.setTexture(intermTexture, index: 1)
+                
+                computeEncoder.setTexture(screenTexture, index: 2)
+                
+                computeEncoder.dispatchThreadgroups(threadGroupCountThresh, threadsPerThreadgroup: threadGroupSizeThresh)
+                
+                computeEncoder.popDebugGroup()
                 
                 computeEncoder.pushDebugGroup("Calculate Color Combined")
                 
