@@ -246,11 +246,11 @@ kernel void distortNoiseKernel(texture2d<float, access::read>  inTexture [[textu
         return;
     }
     float4 inColor = inTexture.read(uint2(gid.x,gid.y));
-    Noise xGen(0.5,0.05,0.02,M_PI_F/4.0,64.0,65536,3039173897u),yGen(0.5,0.05,0.02,M_PI_F/4.0,64.0,131072,3039176417u);
+    Noise xGen(0.5,0.05,0.02,M_PI_F/4.0,64.0,65536,3039173897u);//,yGen(0.5,0.05,0.02,M_PI_F/4.0,64.0,131072,3039176417u);
     float green = (1.0 + xGen.gen((float(gid.x)+uniforms.tOffset)/32.0, (float(gid.y)+uniforms.tOffset*50.0)/16.0, 0.0))/2.0;
-    float blue = (1.0 + yGen.gen((float(gid.x)+uniforms.tOffset)/32.0, (float(gid.y)+uniforms.tOffset*50.0)/16.0, 0.0))/2.0;
+    //float blue = (1.0 + yGen.gen((float(gid.x)+uniforms.tOffset)/32.0, (float(gid.y)+uniforms.tOffset*50.0)/16.0, 0.0))/2.0;
     
-    outTexture.write(float4(inColor.x,green,blue,1.0), uint2(gid.x,gid.y));
+    outTexture.write(float4(inColor.x,green,0.0,1.0), uint2(gid.x,gid.y));
 }
 
 kernel void distortKernel(texture2d<float, access::read>  inTexture [[texture(0)]],
