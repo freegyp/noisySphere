@@ -137,10 +137,10 @@ class Renderer: NSObject, MTKViewDelegate {
             return nil
         }
         
-        threadGroupSize = MTLSize(width: 16, height: 8, depth: 1)
-        threadGroupCount = MTLSize(width: 16, height: 32, depth: 1)
+        threadGroupSize = MTLSize(width: 16, height: 32, depth: 1)
+        threadGroupCount = MTLSize(width: 16, height: 8, depth: 1)
         
-        threadGroupSizeThresh = MTLSize(width: 16, height: 8, depth: 1)
+        threadGroupSizeThresh = MTLSize(width: 16, height: 32, depth: 1)
         threadGroupCountThresh = MTLSize(width: viewWidth/threadGroupSizeThresh.width+1, height: viewHeight/threadGroupSizeThresh.height+1, depth: 1)
         
         
@@ -362,7 +362,7 @@ class Renderer: NSObject, MTKViewDelegate {
         touchSemaphore.signal()
         uniforms[0].normalMatrix = simd_inverse(simd_transpose(uniforms[0].modelViewMatrix))
         uniforms[0].tOffset = tOffset
-        tOffset += 0.06
+        tOffset += 0.09
     }
     
     func draw(in view: MTKView) {
